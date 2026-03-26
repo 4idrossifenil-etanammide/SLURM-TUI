@@ -142,7 +142,3 @@ echo "Job $SLURM_JOB_ID finished at $(date)"
 - Python 3.7+
 - SLURM CLI tools (`sbatch`, `sinfo`, `sacctmgr`) -- for auto-detection and job submission
 - A terminal that supports curses
-
-## License
-
-MIT
