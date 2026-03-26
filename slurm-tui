@@ -620,7 +620,8 @@ def run_tui(stdscr, fields: List[Field]):
                         stdscr.move(disp_row, cx)
 
                     ech = stdscr.getch()
-                    if ech in (10, 13, 27, curses.KEY_UP, curses.KEY_DOWN, 9):
+                    if ech in (10, 13, 27, curses.KEY_UP, curses.KEY_DOWN, 9,
+                              16, 17, 18, 19):  # also break on Ctrl+P/Q/R/S
                         break
                     elif ech in (curses.KEY_BACKSPACE, 127, 8):
                         if cursor > 0:
@@ -653,6 +654,8 @@ def run_tui(stdscr, fields: List[Field]):
                     current = (current - 1) % total_items
                 elif ech == curses.KEY_DOWN or ech == 9:
                     current = (current + 1) % total_items
+                elif ech in (16, 17, 18, 19):
+                    ch = ech  # forward Ctrl+key to global hotkeys below
 
             # Selector: Enter cycles to the next option
             elif f.options and ch in (10, 13):

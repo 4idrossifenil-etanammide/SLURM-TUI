@@ -64,6 +64,8 @@ ln -s "$(pwd)/SLURM-TUI/slurm-tui" ~/.local/bin/slurm-tui
 ```
 
 > Make sure `~/.local/bin` (or wherever you place it) is in your `$PATH`.
+>
+> **Note:** If the command is not found after installing, you may need to close and reopen your SSH session (or run `hash -r`) for the shell to pick up the new executable.
 
 ## Usage
 
