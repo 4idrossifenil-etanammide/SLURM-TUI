@@ -1,0 +1,806 @@
+#!/usr/bin/env python3
+"""
+slurm-tui - A lightweight terminal UI for creating and launching SLURM jobs.
+
+Zero external dependencies. Uses only Python 3 standard library (curses).
+Auto-detects cluster accounts, partitions, and QOS from SLURM tools.
+
+Usage:
+    slurm-tui              # Interactive mode - start with sensible defaults
+    slurm-tui template.sh  # Pre-fill fields from an existing SLURM script
+
+Keybindings (main form):
+    Up/Down, Tab/Shift-Tab   Navigate between fields
+    Left/Right               Cycle through selector options
+    Any printable key        Start editing a text field
+    Backspace                Delete last character in text field
+    Enter                    Open multi-line editor (Commands field)
+                             Cycle option (selector fields)
+    Ctrl+S                   Save script to .sh file
+    Ctrl+R                   Submit job directly via sbatch
+    Ctrl+P                   Preview generated script
+    Ctrl+Q                   Quit
+
+Keybindings (command editor):
+    Ctrl+S                   Save and close editor
+    Esc                      Cancel and discard changes
+    Arrow keys               Move cursor
+    Enter                    New line
+
+Keybindings (save prompt):
+    Enter                    Confirm filename
+    Esc                      Cancel save
+"""
+
+import curses
+import os
+import subprocess
+import sys
+import re
+import tempfile
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+# ---------------------------------------------------------------------------
+# Cluster defaults - used as fallbacks when auto-detection fails
+# ---------------------------------------------------------------------------
+
+PARTITIONS = ["boost_usr_prod", "dcgp_usr_prod", "lrd_all_serial"]
+ACCOUNTS = []
+QOS_OPTIONS = ["boost_qos_bprod", "boost_qos_dbg"]
+GPU_TYPES = ["a100", "quadro"]
+
+
+# ---------------------------------------------------------------------------
+# Auto-detection helpers
+# ---------------------------------------------------------------------------
+
+def detect_accounts() -> List[str]:
+    """
+    Query sacctmgr for the current user's billing accounts.
+    Returns a sorted, deduplicated list or ["default"] on failure.
+    """
+    try:
+        out = subprocess.check_output(
+            ["sacctmgr", "-nP", "show", "associations",
+             f"user={os.environ.get('USER', '')}", "format=Account"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5
+        )
+        accts = sorted(set(line.strip() for line in out.splitlines() if line.strip()))
+        return accts if accts else ["default"]
+    except Exception:
+        return ["default"]
+
+
+def detect_partitions() -> List[str]:
+    """
+    Query sinfo for available partitions.
+    Strips the trailing '*' that marks the default partition.
+    Returns the fallback PARTITIONS list on failure.
+    """
+    try:
+        out = subprocess.check_output(
+            ["sinfo", "-h", "-o", "%P"], text=True, stderr=subprocess.DEVNULL, timeout=5
+        )
+        parts = sorted(set(line.strip().rstrip("*") for line in out.splitlines() if line.strip()))
+        return parts if parts else PARTITIONS
+    except Exception:
+        return PARTITIONS
+
+
+def detect_qos() -> List[str]:
+    """
+    Query sacctmgr for QOS options available to the current user.
+    Each association row may list multiple QOS separated by commas.
+    Returns the fallback QOS_OPTIONS list on failure.
+    """
+    try:
+        out = subprocess.check_output(
+            ["sacctmgr", "-nP", "show", "associations",
+             f"user={os.environ.get('USER', '')}", "format=QOS"],
+            text=True, stderr=subprocess.DEVNULL, timeout=5
+        )
+        all_qos = set()
+        for line in out.splitlines():
+            for qos in line.strip().split(","):
+                qos = qos.strip()
+                if qos:
+                    all_qos.add(qos)
+        return sorted(all_qos) if all_qos else QOS_OPTIONS
+    except Exception:
+        return QOS_OPTIONS
+
+
+# ---------------------------------------------------------------------------
+# Field model
+# ---------------------------------------------------------------------------
+
+@dataclass
+class Field:
+    """
+    Represents a single form field in the TUI.
+
+    Attributes:
+        label:    Display name shown to the left of the value.
+        key:      Corresponding SBATCH flag (e.g. "job-name" -> --job-name).
+                  Keys starting with '_' are internal and not emitted as flags.
+        value:    Current string value.
+        options:  If non-empty, the field becomes a selector (cycle with arrows).
+        required: If True, a '*' marker is shown next to the label.
+        help:     Short hint displayed when the field is focused.
+        section:  If set, a section header is rendered above this field.
+    """
+    label: str
+    key: str
+    value: str = ""
+    options: List[str] = field(default_factory=list)
+    required: bool = False
+    help: str = ""
+    section: str = ""
+
+
+def make_fields(partitions: List[str], accounts: List[str], qos_options: List[str]) -> List[Field]:
+    """Build the ordered list of form fields with detected cluster values."""
+    return [
+        # -- Job Identity --
+        Field("Job Name",       "job-name",    "my_job",    help="Name shown in squeue",
+              section="--- Job Identity ---"),
+        Field("Account",        "account",     accounts[0] if accounts else "", accounts, True,
+              "< > to cycle"),
+        Field("Partition",      "partition",   partitions[0] if partitions else "", partitions, True,
+              "< > to cycle"),
+        Field("QOS",            "qos",         "normal", qos_options, False,
+              "< > to cycle"),
+
+        # -- Resources --
+        Field("Nodes",          "nodes",       "1",         help="Number of nodes",
+              section="--- Resources ---"),
+        Field("Tasks per Node", "ntasks-per-node", "1",     help="MPI tasks per node"),
+        Field("CPUs per Task",  "cpus-per-task", "4",       help="CPU cores per task"),
+        Field("GPUs per Node",  "gpus-per-node", "1",       help="GPUs per node (0 for none)"),
+        Field("GPU Type",       "_gpu_type",   "a100",      GPU_TYPES, False, "< > to cycle"),
+        Field("Time Limit",     "time",        "01:00:00",  help="Max walltime HH:MM:SS"),
+        Field("Memory",         "mem",         "64G",       help="Memory per node (e.g. 64G)"),
+
+        # -- Output & Notifications --
+        Field("Output File",    "output",      "slurm-%j.out", help="%j = job ID",
+              section="--- Output & Notifications ---"),
+        Field("Error File",     "error",       "slurm-%j.err", help="%j = job ID"),
+        Field("Mail Type",      "mail-type",   "",          ["", "BEGIN", "END", "FAIL", "ALL"], False,
+              "< > to cycle"),
+        Field("Mail User",      "mail-user",   "",          help="Email address"),
+
+        # -- Shell Commands --
+        Field("Commands",       "_commands",   "",          help="Enter to open editor",
+              section="--- Shell Commands (runs after #SBATCH) ---"),
+    ]
+
+
+# ---------------------------------------------------------------------------
+# Script generation
+# ---------------------------------------------------------------------------
+
+def generate_script(fields: List[Field]) -> str:
+    """
+    Convert the current field values into a complete SLURM batch script.
+
+    Internal fields (key starting with '_') are handled specially:
+      - _gpu_type:  combined with gpus-per-node to produce --gres=gpu:TYPE:N
+      - _commands:  appended as shell commands in the script body
+    """
+    lines = ["#!/bin/bash"]
+    gpu_type = ""
+    commands = ""
+
+    for f in fields:
+        if f.key == "_gpu_type":
+            gpu_type = f.value
+            continue
+        if f.key == "_commands":
+            commands = f.value
+            continue
+        if not f.value or f.value.strip() == "":
+            continue
+
+        # GPU fields get special --gres syntax
+        if f.key == "gpus-per-node":
+            n = f.value.strip()
+            if n == "0":
+                continue
+            if gpu_type:
+                lines.append(f"#SBATCH --gres=gpu:{gpu_type}:{n}")
+            else:
+                lines.append(f"#SBATCH --gpus-per-node={n}")
+            continue
+
+        lines.append(f"#SBATCH --{f.key}={f.value}")
+
+    lines.append("")
+    lines.append("# -- Environment --")
+    lines.append("echo \"Job $SLURM_JOB_ID started on $(hostname) at $(date)\"")
+    lines.append("echo \"Nodes: $SLURM_JOB_NODELIST\"")
+    lines.append("")
+
+    if commands.strip():
+        lines.append("# -- User commands --")
+        lines.extend(commands.strip().splitlines())
+    else:
+        lines.append("# TODO: Add your commands here")
+        lines.append("# Example:")
+        lines.append("#   module load python/3.12")
+        lines.append("#   srun python train.py")
+
+    lines.append("")
+    lines.append("echo \"Job $SLURM_JOB_ID finished at $(date)\"")
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Script parser (pre-fill from existing .sh)
+# ---------------------------------------------------------------------------
+
+def parse_script(filepath: str, fields: List[Field]) -> None:
+    """
+    Read an existing SLURM script and populate matching fields.
+
+    Handles the special --gres=gpu:TYPE:N syntax by splitting it into
+    the _gpu_type and gpus-per-node fields. Also extracts non-SBATCH,
+    non-boilerplate lines as the commands body.
+    """
+    try:
+        with open(filepath) as f:
+            content = f.read()
+    except Exception:
+        return
+
+    field_map = {fld.key: fld for fld in fields}
+    sbatch_re = re.compile(r"^#SBATCH\s+--(\S+?)=(.+)$", re.MULTILINE)
+    gres_re = re.compile(r"^#SBATCH\s+--gres=gpu:(\w+):(\d+)$", re.MULTILINE)
+
+    # Parse --gres line separately since it maps to two fields
+    m = gres_re.search(content)
+    if m:
+        if "_gpu_type" in field_map:
+            field_map["_gpu_type"].value = m.group(1)
+        if "gpus-per-node" in field_map:
+            field_map["gpus-per-node"].value = m.group(2)
+
+    for match in sbatch_re.finditer(content):
+        key, val = match.group(1), match.group(2).strip()
+        if key == "gres":
+            continue  # already handled above
+        if key in field_map:
+            field_map[key].value = val
+
+    # Extract command body (non-SBATCH, non-shebang lines after headers)
+    cmd_lines = []
+    in_body = False
+    for line in content.splitlines():
+        if line.startswith("#SBATCH") or line.startswith("#!/"):
+            continue
+        if not in_body:
+            if line.strip() and not line.startswith("#"):
+                in_body = True
+        if in_body and not line.startswith("echo \"Job $SLURM"):
+            cmd_lines.append(line)
+
+    if "_commands" in field_map and cmd_lines:
+        field_map["_commands"].value = "\n".join(cmd_lines).strip()
+
+
+# ---------------------------------------------------------------------------
+# Curses color pairs
+# ---------------------------------------------------------------------------
+
+COLOR_TITLE = 1
+COLOR_LABEL = 2
+COLOR_VALUE = 3
+COLOR_ACTIVE = 4
+COLOR_HELP = 5
+COLOR_BUTTON = 6
+COLOR_STATUS = 7
+
+
+def init_colors():
+    """Initialize curses color pairs using the terminal's default background."""
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(COLOR_TITLE,  curses.COLOR_CYAN,    -1)
+    curses.init_pair(COLOR_LABEL,  curses.COLOR_WHITE,   -1)
+    curses.init_pair(COLOR_VALUE,  curses.COLOR_GREEN,   -1)
+    curses.init_pair(COLOR_ACTIVE, curses.COLOR_BLACK,   curses.COLOR_CYAN)
+    curses.init_pair(COLOR_HELP,   curses.COLOR_YELLOW,  -1)
+    curses.init_pair(COLOR_BUTTON, curses.COLOR_BLACK,   curses.COLOR_GREEN)
+    curses.init_pair(COLOR_STATUS, curses.COLOR_RED,     -1)
+
+
+# ---------------------------------------------------------------------------
+# Multi-line command editor
+# ---------------------------------------------------------------------------
+
+def edit_multiline(stdscr, initial: str) -> str:
+    """
+    Full-screen text editor for the Commands field.
+
+    Supports basic editing: arrow navigation, Enter for new lines,
+    Backspace/Delete, Home/End. Line numbers are displayed on the left.
+
+    Returns:
+        The edited text on Ctrl+S, or the original text on Esc.
+    """
+    curses.curs_set(1)
+    lines = initial.split("\n") if initial else [""]
+    cy, cx = 0, 0
+    top = 0  # first visible line (vertical scroll offset)
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+        header = " EDIT COMMANDS -- Ctrl+S: save and close  Esc: cancel "
+        stdscr.addstr(0, 0, header[:w-1],
+                       curses.color_pair(COLOR_TITLE) | curses.A_BOLD)
+        view_h = h - 2  # lines available for text (minus header and status)
+
+        for i in range(view_h):
+            li = top + i
+            if li < len(lines):
+                ln_prefix = f"{li+1:>4} "
+                txt = ln_prefix + lines[li]
+                stdscr.addstr(i + 1, 0, txt[:w-1])
+
+        # Status bar
+        stdscr.addstr(h - 1, 0, f" Line {cy+1}/{len(lines)}  Col {cx+1} ",
+                       curses.color_pair(COLOR_HELP))
+
+        # Position cursor (offset by line-number gutter width)
+        ln_w = 5  # "   1 " = 5 chars
+        screen_y = cy - top + 1
+        screen_x = min(ln_w + cx, w - 1)
+        if 1 <= screen_y < h - 1:
+            stdscr.move(screen_y, screen_x)
+
+        ch = stdscr.getch()
+
+        if ch == 27:  # Esc -> cancel
+            curses.curs_set(0)
+            return initial
+        elif ch == 19:  # Ctrl+S -> save
+            curses.curs_set(0)
+            return "\n".join(lines)
+        elif ch == curses.KEY_UP:
+            cy = max(0, cy - 1)
+            cx = min(cx, len(lines[cy]))
+        elif ch == curses.KEY_DOWN:
+            cy = min(len(lines) - 1, cy + 1)
+            cx = min(cx, len(lines[cy]))
+        elif ch == curses.KEY_LEFT:
+            cx = max(0, cx - 1)
+        elif ch == curses.KEY_RIGHT:
+            cx = min(len(lines[cy]), cx + 1)
+        elif ch == curses.KEY_HOME:
+            cx = 0
+        elif ch == curses.KEY_END:
+            cx = len(lines[cy])
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            if cx > 0:
+                lines[cy] = lines[cy][:cx-1] + lines[cy][cx:]
+                cx -= 1
+            elif cy > 0:
+                # Join with previous line
+                cx = len(lines[cy - 1])
+                lines[cy - 1] += lines[cy]
+                lines.pop(cy)
+                cy -= 1
+        elif ch == curses.KEY_DC:  # Delete key
+            if cx < len(lines[cy]):
+                lines[cy] = lines[cy][:cx] + lines[cy][cx+1:]
+            elif cy < len(lines) - 1:
+                lines[cy] += lines[cy + 1]
+                lines.pop(cy + 1)
+        elif ch in (10, 13):  # Enter -> new line
+            rest = lines[cy][cx:]
+            lines[cy] = lines[cy][:cx]
+            cy += 1
+            cx = 0
+            lines.insert(cy, rest)
+        elif 32 <= ch <= 126:  # Printable characters
+            lines[cy] = lines[cy][:cx] + chr(ch) + lines[cy][cx:]
+            cx += 1
+
+        # Keep cursor in view
+        if cy < top:
+            top = cy
+        if cy >= top + view_h:
+            top = cy - view_h + 1
+
+
+# ---------------------------------------------------------------------------
+# Main TUI
+# ---------------------------------------------------------------------------
+
+def run_tui(stdscr, fields: List[Field]):
+    """
+    Main form loop. Renders fields with section headers, handles navigation,
+    inline text editing, selector cycling, and dispatches to global actions
+    (save, submit, preview, quit).
+
+    Returns:
+        ("submit", script_text) to submit via sbatch, or None if cancelled.
+    """
+    init_colors()
+    curses.curs_set(0)
+    stdscr.keypad(True)
+    # Disable XON/XOFF flow control so Ctrl+S and Ctrl+Q reach the app
+    os.system("stty -ixon 2>/dev/null")
+
+    current = 0       # index of the currently focused item (field or button)
+    scroll_top = 0    # first visible display row
+    status_msg = ""
+    result = None
+
+    BUTTONS = ["[^S] Save Script", "[^R] Submit (sbatch)", "[^P] Preview", "[^Q] Quit"]
+    total_items = len(fields) + len(BUTTONS)
+
+    FIELD_START = 3   # first row where fields are drawn
+    LABEL_W = 18      # character width reserved for labels
+
+    while True:
+        stdscr.erase()
+        h, w = stdscr.getmaxyx()
+
+        # -- Title bar --
+        title = " SLURM Job Builder "
+        stdscr.addstr(0, 0, " " * w, curses.color_pair(COLOR_TITLE))
+        stdscr.addstr(0, (w - len(title)) // 2, title,
+                       curses.color_pair(COLOR_TITLE) | curses.A_BOLD)
+
+        # -- Help bar --
+        help_line = " Up/Down/Tab:Navigate  Left/Right:Cycle options  Type:Edit  ^S:Save  ^R:Run  ^P:Preview  ^Q:Quit "
+        stdscr.addstr(1, 0, help_line[:w-1], curses.color_pair(COLOR_HELP))
+
+        visible = h - FIELD_START - 3  # rows available for content
+
+        # -- Build display rows --
+        # Each entry: (row_type, payload, selectable_index)
+        #   row_type: "section", "field", "cmdpreview", "button", "blank"
+        #   selectable_index: >=0 for focusable items, -1 for decoration
+        display_rows = []
+        for idx, fld in enumerate(fields):
+            if fld.section:
+                display_rows.append(("section", fld.section, -1))
+            display_rows.append(("field", idx, idx))
+            # Show a preview of commands below the Commands field
+            if fld.key == "_commands" and fld.value:
+                for cmd_line in fld.value.splitlines()[:3]:
+                    display_rows.append(("cmdpreview", cmd_line, -1))
+                if len(fld.value.splitlines()) > 3:
+                    display_rows.append(("cmdpreview",
+                        f"  ... ({len(fld.value.splitlines())} lines total)", -1))
+
+        display_rows.append(("blank", None, -1))
+        for bi in range(len(BUTTONS)):
+            display_rows.append(("button", bi, len(fields) + bi))
+
+        # -- Scroll to keep current item visible --
+        current_display_row = 0
+        for di, (dtype, data, item_idx) in enumerate(display_rows):
+            if item_idx == current:
+                current_display_row = di
+                break
+
+        if current_display_row < scroll_top:
+            scroll_top = current_display_row
+        if current_display_row >= scroll_top + visible:
+            scroll_top = current_display_row - visible + 1
+
+        # -- Render visible rows --
+        row = FIELD_START
+        for di in range(scroll_top, min(len(display_rows), scroll_top + visible)):
+            dtype, data, item_idx = display_rows[di]
+
+            if dtype == "section":
+                stdscr.addstr(row, 1, data[:w-2],
+                               curses.color_pair(COLOR_TITLE) | curses.A_BOLD)
+
+            elif dtype == "cmdpreview":
+                stdscr.addstr(row, LABEL_W + 4, data[:w - LABEL_W - 5],
+                               curses.color_pair(COLOR_HELP) | curses.A_DIM)
+
+            elif dtype == "field":
+                fld = fields[data]
+                is_active = item_idx == current
+                attr_label = curses.color_pair(COLOR_ACTIVE) if is_active else curses.color_pair(COLOR_LABEL)
+                attr_val = curses.color_pair(COLOR_ACTIVE) | curses.A_BOLD if is_active else curses.color_pair(COLOR_VALUE)
+
+                marker = "*" if fld.required else " "
+                label = f"{marker}{fld.label:>{LABEL_W - 1}}: "
+                stdscr.addstr(row, 0, label[:w], attr_label)
+
+                val_x = LABEL_W + 2
+                if fld.key == "_commands":
+                    if fld.value:
+                        n = len(fld.value.splitlines())
+                        disp = f"[{n} line{'s' if n != 1 else ''}] Enter=edit"
+                    else:
+                        disp = "(empty) Enter=open editor"
+                elif fld.options:
+                    disp = f"< {fld.value} >"
+                else:
+                    disp = fld.value if fld.value else ""
+
+                if val_x + len(disp) < w:
+                    stdscr.addstr(row, val_x, disp, attr_val)
+
+                if is_active and fld.help:
+                    help_x = val_x + len(disp) + 2
+                    if help_x + len(fld.help) + 2 < w:
+                        stdscr.addstr(row, help_x, f"({fld.help})",
+                                       curses.color_pair(COLOR_HELP))
+
+            elif dtype == "button":
+                is_active = item_idx == current
+                attr = curses.color_pair(COLOR_BUTTON) | curses.A_BOLD if is_active else curses.color_pair(COLOR_LABEL)
+                btn_text = f"  {BUTTONS[data]}  "
+                x = (w - len(btn_text)) // 2
+                stdscr.addstr(row, max(0, x), btn_text[:w-1], attr)
+
+            row += 1
+
+        # -- Status bar --
+        if status_msg:
+            stdscr.addstr(h - 1, 0, status_msg[:w-1],
+                           curses.color_pair(COLOR_STATUS) | curses.A_BOLD)
+
+        stdscr.refresh()
+        ch = stdscr.getch()
+        status_msg = ""
+
+        # -- Selector cycling (must be checked before navigation) --
+        is_on_field = current < len(fields)
+        f = fields[current] if is_on_field else None
+        handled = False
+
+        if is_on_field and f.options and ch in (curses.KEY_LEFT, curses.KEY_RIGHT):
+            try:
+                ci = f.options.index(f.value)
+            except ValueError:
+                ci = 0
+            if ch == curses.KEY_LEFT:
+                ci = (ci - 1) % len(f.options)
+            else:
+                ci = (ci + 1) % len(f.options)
+            f.value = f.options[ci]
+            handled = True
+
+        # -- Navigation --
+        if not handled and ch == curses.KEY_UP:
+            current = (current - 1) % total_items
+            handled = True
+        elif not handled and ch == curses.KEY_DOWN:
+            current = (current + 1) % total_items
+            handled = True
+        elif not handled and ch == 9:  # Tab
+            current = (current + 1) % total_items
+            handled = True
+        elif not handled and ch == 353:  # Shift-Tab
+            current = (current - 1) % total_items
+            handled = True
+
+        # -- Field editing --
+        if not handled and is_on_field:
+
+            # Commands field: Enter opens the multi-line editor
+            if f.key == "_commands" and ch in (10, 13):
+                f.value = edit_multiline(stdscr, f.value)
+                handled = True
+
+            # Text field: any printable key starts inline editing
+            elif not f.options and (32 <= ch <= 126):
+                curses.curs_set(1)
+                edit_buf = list(f.value)
+                edit_buf.append(chr(ch))
+                cursor = len(edit_buf)
+
+                while True:
+                    val_x = LABEL_W + 2
+                    # Find the screen row for this field
+                    disp_row = None
+                    for di_idx, (dt, dd, ii) in enumerate(display_rows):
+                        if ii == current:
+                            disp_row = FIELD_START + di_idx - scroll_top
+                            break
+                    if disp_row is not None and 0 <= disp_row < h - 2:
+                        stdscr.move(disp_row, val_x)
+                        stdscr.clrtoeol()
+                        text = "".join(edit_buf)
+                        stdscr.addstr(disp_row, val_x, text[:w - val_x - 1],
+                                       curses.color_pair(COLOR_ACTIVE) | curses.A_BOLD)
+                        cx = min(val_x + cursor, w - 2)
+                        stdscr.move(disp_row, cx)
+
+                    ech = stdscr.getch()
+                    if ech in (10, 13, 27, curses.KEY_UP, curses.KEY_DOWN, 9):
+                        break
+                    elif ech in (curses.KEY_BACKSPACE, 127, 8):
+                        if cursor > 0:
+                            edit_buf.pop(cursor - 1)
+                            cursor -= 1
+                    elif ech == curses.KEY_LEFT:
+                        cursor = max(0, cursor - 1)
+                    elif ech == curses.KEY_RIGHT:
+                        cursor = min(len(edit_buf), cursor + 1)
+                    elif ech == curses.KEY_HOME:
+                        cursor = 0
+                    elif ech == curses.KEY_END:
+                        cursor = len(edit_buf)
+                    elif ech == curses.KEY_DC:
+                        if cursor < len(edit_buf):
+                            edit_buf.pop(cursor)
+                    elif ech == 21:  # Ctrl-U: clear the entire line
+                        edit_buf.clear()
+                        cursor = 0
+                    elif 32 <= ech <= 126:
+                        edit_buf.insert(cursor, chr(ech))
+                        cursor += 1
+
+                f.value = "".join(edit_buf)
+                curses.curs_set(0)
+                handled = True
+
+                # Pass through the key that ended editing
+                if ech == curses.KEY_UP:
+                    current = (current - 1) % total_items
+                elif ech == curses.KEY_DOWN or ech == 9:
+                    current = (current + 1) % total_items
+
+            # Selector: Enter cycles to the next option
+            elif f.options and ch in (10, 13):
+                try:
+                    ci = f.options.index(f.value)
+                except ValueError:
+                    ci = -1
+                f.value = f.options[(ci + 1) % len(f.options)]
+                handled = True
+
+            # Backspace outside edit mode: remove last character
+            elif not f.options and ch in (curses.KEY_BACKSPACE, 127, 8):
+                if f.value:
+                    f.value = f.value[:-1]
+                handled = True
+
+        # -- Button activation via Enter --
+        if not handled and current >= len(fields) and ch in (10, 13):
+            btn_idx = current - len(fields)
+            if btn_idx == 0:
+                ch = 19   # -> Ctrl+S
+            elif btn_idx == 1:
+                ch = 18   # -> Ctrl+R
+            elif btn_idx == 2:
+                ch = 16   # -> Ctrl+P
+            elif btn_idx == 3:
+                ch = 17   # -> Ctrl+Q
+
+        # -- Global hotkeys (Ctrl+key) --
+        if ch == 17:  # Ctrl+Q -> Quit
+            result = None
+            break
+
+        elif ch == 16:  # Ctrl+P -> Preview
+            script = generate_script(fields)
+            stdscr.erase()
+            stdscr.addstr(0, 0, " PREVIEW (press any key to return) ",
+                           curses.color_pair(COLOR_TITLE) | curses.A_BOLD)
+            for i, line in enumerate(script.splitlines()):
+                if i + 2 >= h - 1:
+                    stdscr.addstr(h - 1, 0, "... (truncated)",
+                                   curses.color_pair(COLOR_HELP))
+                    break
+                stdscr.addstr(i + 2, 0, line[:w-1], curses.color_pair(COLOR_VALUE))
+            stdscr.getch()
+
+        elif ch == 19:  # Ctrl+S -> Save script to file
+            curses.curs_set(1)
+            job_name = ""
+            for fld in fields:
+                if fld.key == "job-name":
+                    job_name = fld.value
+                    break
+            default_path = f"{job_name or 'job'}.sh"
+
+            prompt_str = f"Save as [{default_path}] (Esc=cancel): "
+            stdscr.addstr(h - 1, 0, " " * (w - 1))
+            stdscr.addstr(h - 1, 0, prompt_str, curses.color_pair(COLOR_HELP))
+            save_buf = []
+            save_cursor = 0
+            save_cancelled = False
+            while True:
+                inp_x = len(prompt_str)
+                stdscr.move(h - 1, inp_x)
+                stdscr.clrtoeol()
+                stdscr.addstr(h - 1, inp_x, "".join(save_buf)[:w - inp_x - 1])
+                stdscr.move(h - 1, inp_x + save_cursor)
+                sch = stdscr.getch()
+                if sch == 27:  # Esc
+                    save_cancelled = True
+                    break
+                elif sch in (10, 13):  # Enter
+                    break
+                elif sch in (curses.KEY_BACKSPACE, 127, 8):
+                    if save_cursor > 0:
+                        save_buf.pop(save_cursor - 1)
+                        save_cursor -= 1
+                elif sch == curses.KEY_LEFT:
+                    save_cursor = max(0, save_cursor - 1)
+                elif sch == curses.KEY_RIGHT:
+                    save_cursor = min(len(save_buf), save_cursor + 1)
+                elif 32 <= sch <= 126:
+                    save_buf.insert(save_cursor, chr(sch))
+                    save_cursor += 1
+            curses.curs_set(0)
+
+            if save_cancelled:
+                status_msg = " Save cancelled "
+            else:
+                path = "".join(save_buf).strip() or default_path
+                script = generate_script(fields)
+                try:
+                    with open(path, "w") as fp:
+                        fp.write(script)
+                    os.chmod(path, 0o755)
+                    status_msg = f" Saved to {os.path.abspath(path)} "
+                except Exception as e:
+                    status_msg = f" Error: {e} "
+
+        elif ch == 18:  # Ctrl+R -> Submit via sbatch
+            script = generate_script(fields)
+            result = ("submit", script)
+            break
+
+    os.system("stty ixon 2>/dev/null")  # restore flow control on exit
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    accounts = detect_accounts()
+    partitions = detect_partitions()
+    qos_list = detect_qos()
+
+    fields = make_fields(partitions, accounts, qos_list)
+
+    # Optionally pre-fill from an existing script
+    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
+        parse_script(sys.argv[1], fields)
+        print(f"Pre-filled from {sys.argv[1]}")
+
+    result = curses.wrapper(lambda stdscr: run_tui(stdscr, fields))
+
+    if result is None:
+        print("Cancelled.")
+    elif result[0] == "submit":
+        script = result[1]
+        print("\n--- Submitting job ---")
+        print(script)
+        print("---")
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".sh", delete=False, prefix="slurm_") as tmp:
+            tmp.write(script)
+            tmp_path = tmp.name
+
+        os.chmod(tmp_path, 0o755)
+        try:
+            proc = subprocess.run(["sbatch", tmp_path], capture_output=True, text=True)
+            if proc.returncode == 0:
+                print(proc.stdout.strip())
+            else:
+                print(f"sbatch failed:\n{proc.stderr.strip()}")
+        finally:
+            os.unlink(tmp_path)
+
+
+if __name__ == "__main__":
+    main()
