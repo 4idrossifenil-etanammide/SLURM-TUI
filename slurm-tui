@@ -171,7 +171,9 @@ def make_fields(partitions: List[str], accounts: List[str], qos_options: List[st
         Field("Mail User",      "mail-user",   "",          help="Email address"),
 
         # -- Shell Commands --
-        Field("Commands",       "_commands",   "",          help="Enter to open editor",
+        Field("Commands",       "_commands",
+              "# Default modules\nmodule load profile/deeplrn\nmodule load cuda/12.1\nmodule load gcc/12.2.0\n\n# Your commands below",
+              help="Enter to open editor",
               section="--- Shell Commands (runs after #SBATCH) ---"),
     ]
 
@@ -227,7 +229,6 @@ def generate_script(fields: List[Field]) -> str:
     else:
         lines.append("# TODO: Add your commands here")
         lines.append("# Example:")
-        lines.append("#   module load python/3.12")
         lines.append("#   srun python train.py")
 
     lines.append("")
